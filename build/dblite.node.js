@@ -44,6 +44,7 @@ THE SOFTWARE.
 */
 /*! a zero hassle wrapper for sqlite by Andrea Giammarchi !*/
 var
+  sqlTest = "",
   isArray = Array.isArray,
   // used to generate unique "end of the query" identifiers
   crypto = require('crypto'),
@@ -68,7 +69,7 @@ var
   // for simple query replacements: WHERE field = ?
   REPLACE_QUESTIONMARKS = /\?/g,
   // for named replacements: WHERE field = :data
-  REPLACE_PARAMS = /(?:\:|\@|\$)([a-zA-Z_$]+)/g,
+  REPLACE_PARAMS = /(?:\:|\@|\$)([a-zA-Z_0-9$]+)/g,
   // the way CSV threats double quotes
   DOUBLE_DOUBLE_QUOTES = /""/g,
   // to escape strings
@@ -78,7 +79,7 @@ var
   // which usually is full of "
   SINGLE_QUOTES_DOUBLED = "''",
   // to verify there are named fields/parametes
-  HAS_PARAMS = /(?:\?|(?:(?:\:|\@|\$)[a-zA-Z_$]+))/,
+  HAS_PARAMS = /(?:\?|(?:(?:\:|\@|\$)[a-zA-Z_0-9$]+))/,
   // shortcut used as deafault notifier
   log = console.log.bind(console),
   // the default binary as array of paths
@@ -105,23 +106,8 @@ var
     ;
 
     // what kind of End Of Line we have here ?
-    EOL = sqliteVersion.length && sqliteVersion.filter(function (n, i) {
-      n = parseInt(n, 10);
-      switch (i) {
-        case 0:
-          return n >= 3;
-        case 1:
-          return n >= 8;
-        case 2:
-          return n >= 6;
-      }
-      return false;
-    }).length === sqliteVersion.length ?
-      '\r\n' :
-      require('os').EOL || (
-        WIN32 ? '\r\n' : '\n'
-      )
-    ;
+    // EOL not worked on Windows 7 with sqlite3 (3.8.8.1), because it's return \n, not Windows EOF \r\n
+    EOL = '\n';
 
     // what's EOL length? Used to properly parse data
     EOL_LENGTH = EOL.length;
@@ -161,7 +147,7 @@ var
  *                        db.query('SELECT table.a, table.other FROM table', ['a', 'b']);
  *                        [{a:'first value', b:'second'},{a:'row2 value', b:'row2'}]
  *
- *                        
+ *
  *                        db.query('SELECT table.a, table.other FROM table', ['a', 'b']);
  *                        [{a:'first value', b:'second'},{a:'row2 value', b:'row2'}]
  *  callback:Function
@@ -222,6 +208,8 @@ function dblite() {
     wasSelect = false,
     wasNotSelect = false,
     wasError = false,
+    longRequest = false,
+    memoryCount = 0,
     // forces the output not to be processed
     // might be handy in some case where it's passed around
     // as string instread of needing to serialize/unserialize
@@ -249,13 +237,13 @@ function dblite() {
   function next() {
     if (queue.length) {
       // ... do that and wait for next check
-      self.query.apply(self, queue.shift());
+      self._query.apply(self, queue.shift());
     }
   }
 
   // common error helper
   function onerror(data) {
-    if($callback && 1 < $callback.length) {  
+    if($callback && 1 < $callback.length) {
       // there is a callback waiting
       // and there is more than an argument in there
       // the callback is waiting for errors too
@@ -285,7 +273,7 @@ function dblite() {
   program.stdout.on('data', function (data) {
     /*jshint eqnull: true*/
     // big output might require more than a call
-    var str, result, callback, fields, headers, wasSelectLocal, rows;
+    var str, result, callback, fields, headers, wasSelectLocal, dontParseCSVLocal, rows;
     if (wasError) {
       selectResult = '';
       wasError = false;
@@ -295,10 +283,28 @@ function dblite() {
       }
       return;
     }
+    memoryCount += data.length;
+
+    if (longRequest && data.toString().slice(SUPER_SECRET_LENGTH) === SUPER_SECRET) {
+      selectResult = "";
+      data = SUPER_SECRET;
+      longRequest = false;
+      console.log("out of memory test", memoryCount, sqlTest);
+    }
+    if (longRequest) {
+      data = "";
+    }
+
+    if (selectResult.length + data.length >= 100000000) {
+      selectResult = '';
+      longRequest = true;
+    }
+
     // the whole output is converted into a string here
-    selectResult += data;
+    selectResult += data.toString();
     // if the end of the output is the serapator
     if (selectResult.slice(SUPER_SECRET_LENGTH) === SUPER_SECRET) {
+      memoryCount = 0;
       // time to move forward since sqlite3 has done
       str = selectResult.slice(0, SUPER_SECRET_LENGTH);
       // drop the secret header if present
@@ -311,6 +317,8 @@ function dblite() {
       // if it was a select
       if (wasSelect || wasNotSelect) {
         wasSelectLocal = wasSelect;
+        // make temporary parse flag
+        dontParseCSVLocal = dontParseCSV;
         // set as false all conditions
         // only here dontParseCSV could have been true
         // set to false that too
@@ -324,7 +332,7 @@ function dblite() {
         if (wasSelectLocal) {
           // unless specified, process the string
           // converting the CSV into an Array of rows
-          result = dontParseCSV ? str : parseCSV(str);
+          result = dontParseCSVLocal ? str : parseCSV(str);
           // if there were headers/fields and we have a result ...
           if (headers && isArray(result) && result.length) {
             //  ... and fields is not defined
@@ -354,7 +362,7 @@ function dblite() {
         next();
         // if there was actually a callback to call
         if (callback) {
-          rows = fields ? (
+          rows = ( ! dontParseCSVLocal && fields) ? (
               // and if there was a need to parse each row
               isArray(fields) ?
                 // as object with properties
@@ -450,13 +458,29 @@ function dblite() {
   // Handy if for some reason data has to be passed around
   // as string instead of being serialized and deserialized
   // as Array of Arrays. Don't use if not needed.
-  self.plain = function() {
-    dontParseCSV = true;
-    return self.query.apply(self, arguments);
+  self.plain = function(string) {
+    if (typeof string !== 'string') throw new Error('Argument #1 should be a string');
+
+    string = {
+      query: string,
+      dontParse: true
+    };
+
+    return self._query.apply(self, arguments);
+  };
+
+  // Send query to database. Main method
+  self.query = function(string) {
+    string = {
+      query: string,
+      dontParse: false
+    };
+
+    return self._query.apply(self, arguments);
   };
 
   // main logic/method/entry point
-  self.query = function(string, params, fields, callback) {
+  self._query = function(string, params, fields, callback) {
     // notWorking is set once .close() has been called
     // it does not make sense to execute anything after
     // the program is being closed
@@ -465,8 +489,18 @@ function dblite() {
     // the progcess is flagged as busy. Just queue other operations
     if (busy) return queue.push(arguments), self;
     // if a SELECT or a PRAGMA ...
+    // unwind arguments
+
+    if (typeof string === 'object') {
+      dontParseCSV = string.dontParse;
+      string = string.query;
+    }
+
     wasSelect = SELECT.test(string);
+    sqlTest = "";
     if (wasSelect) {
+      sqlTest = string + " " + (Object.prototype.toString.call(params) == "[object Object]" ? JSON.stringify(params): "");
+
       // SELECT and PRAGMA makes `dblite` busy
       busy = true;
       switch(arguments.length) {
@@ -482,6 +516,7 @@ function dblite() {
           if (typeof fields == 'function') {
             // assign it
             $callback = fields;
+            fields = null;
             // has string parameters to repalce
             // such ? or :id and others ?
             if (HAS_PARAMS.test(string)) {
@@ -568,7 +603,7 @@ function dblite() {
                 string
               ));
               // keep checking for possible following operations
-              process.nextTick(next);
+              setImmediate(next);
               break;
             }
             fields = params;
@@ -595,6 +630,28 @@ function dblite() {
     // chainability just useful here for multiple queries at once
     return self;
   };
+
+  // to manually parse CSV data if necessary
+  // mainly to be able to use db.plain(SQL)
+  // without parsing it right away and pass the string
+  // around instead of serializing and de-serializing it
+  // all the time. Ideally this is a scenario for clusters
+  // no need to usually do manually anything otherwise.
+  self.parseCSV = parseCSV;
+
+  // how to manually escape data
+  // might be handy to write directly SQL strings
+  // instead of using handy paramters Array/Object
+  // usually you don't want to do this
+  self.escape = escape;
+
+  // converter rows to objects for map method.
+  // example:
+  // rows.map(dblite.row2object, fields)
+  self.row2object = row2object;
+  self.row2parsed = row2parsed;
+  self.parseFields = parseFields;
+
   return self;
 }
 
@@ -756,7 +813,19 @@ function row2parsed(row) {
     length = fields.length,
     i = 0; i < length; i++
   ) {
-    out[fields[i]] = parsers[i](row[i]);
+    if (parsers[i] === Buffer) {
+      out[fields[i]] = parsers[i](row[i], 'hex');
+    } else if (parsers[i] === Array) {
+      out[fields[i]] = row[i] ? row[i].split(",") : [];
+    } else if (parsers[i] === String) {
+      try {
+        out[fields[i]] = JSON.parse(JSON.stringify((row[i] || "")));
+      } catch (e) {
+        out[fields[i]] = row[i];
+      }
+    } else {
+      out[fields[i]] = parsers[i](row[i]);
+    }
   }
   return out;
 }
@@ -773,12 +842,16 @@ function escape(what) {
         SINGLE_QUOTES, SINGLE_QUOTES_DOUBLED
       ) + "'";
     case 'object':
-      return what == null ?
-        'null' :
-        ("'" + JSON.stringify(what).replace(
+      if (what == null) {
+        return 'null';
+      } else if (Buffer.isBuffer(what)) {
+        return "X'" + what.toString('hex') + "'";
+      } else {
+        return ("'" + JSON.stringify(what).replace(
           SINGLE_QUOTES, SINGLE_QUOTES_DOUBLED
-        ) + "'")
-      ;
+        ) + "'");
+      }
+    break;
     // SQLite has no Boolean type
     case 'boolean':
       return what ? '1' : '0'; // 1 => true, 0 => false
@@ -787,7 +860,7 @@ function escape(what) {
       if (isFinite(what)) return '' + what;
   }
   // all other cases
-  throw new Error('unsupported data');
+  throw new Error('unsupported data ' + what);
 }
 
 // makes an SQL statement OK for dblite <=> sqlite communications
@@ -853,20 +926,6 @@ dblite.withSQLite = function (sqliteVersion) {
     dblite.sqliteVersion = sqliteVersion;
     return dblite;
 };
-
-// to manually parse CSV data if necessary
-// mainly to be able to use db.plain(SQL)
-// without parsing it right away and pass the string
-// around instead of serializing and de-serializing it
-// all the time. Ideally this is a scenario for clusters
-// no need to usually do manually anything otherwise.
-dblite.parseCSV = parseCSV;
-
-// how to manually escape data
-// might be handy to write directly SQL strings
-// instead of using handy paramters Array/Object
-// usually you don't want to do this
-dblite.escape = escape;
 
 // that's it!
 module.exports = dblite;
